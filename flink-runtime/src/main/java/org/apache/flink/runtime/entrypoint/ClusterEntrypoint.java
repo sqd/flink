@@ -42,6 +42,7 @@ import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.blob.BlobUtils;
 import org.apache.flink.runtime.clusterframework.ApplicationStatus;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
+import org.apache.flink.runtime.dispatcher.CompletedJobsPersistenceOptions;
 import org.apache.flink.runtime.dispatcher.ExecutionGraphInfoStore;
 import org.apache.flink.runtime.entrypoint.component.DispatcherResourceManagerComponent;
 import org.apache.flink.runtime.entrypoint.component.DispatcherResourceManagerComponentFactory;
@@ -222,6 +223,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
     public void startCluster() throws ClusterEntrypointException {
         LOG.info("Starting {}.", getClass().getSimpleName());
+        logImcRuntimePatchBanner();
 
         try {
             FlinkSecurityManager.setFromConfiguration(configuration);
@@ -265,6 +267,27 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
     protected boolean supportsReactiveMode() {
         return false;
+    }
+
+    /**
+     * Logs a banner identifying this flink-runtime as the IMC-patched build. Emitted on every
+     * JobManager start (not only on recovery) so that it is trivial to tell from the JobManager log
+     * whether the patched jar is actually on the classpath.
+     */
+    private void logImcRuntimePatchBanner() {
+        final String completedJobsPersistDir =
+                configuration.get(CompletedJobsPersistenceOptions.COMPLETED_JOBS_PERSIST_DIR);
+        LOG.info(
+                "IMC: using this patch - patched flink-runtime is active. "
+                        + "Included fixes: [FLINK-38770] parallelism overrides are applied after the "
+                        + "StreamGraph -> JobGraph conversion; "
+                        + "[IMC completed-jobs durable store] terminal jobs are persisted to '{}' "
+                        + "({}) so the final savepoint path survives a JobManager crash.",
+                completedJobsPersistDir == null ? "<unset>" : completedJobsPersistDir,
+                completedJobsPersistDir == null
+                        ? "disabled, set "
+                                + CompletedJobsPersistenceOptions.COMPLETED_JOBS_PERSIST_DIR.key()
+                        : "enabled");
     }
 
     private void configureFileSystems(Configuration configuration, PluginManager pluginManager) {

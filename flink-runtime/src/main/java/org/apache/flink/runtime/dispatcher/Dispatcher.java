@@ -182,6 +182,8 @@ public abstract class Dispatcher extends FencedRpcEndpoint<DispatcherId>
 
     private final HistoryServerArchivist historyServerArchivist;
 
+    @Nullable private final DurableExecutionGraphInfoPersister durableExecutionGraphInfoPersister;
+
     private final Executor ioExecutor;
 
     @Nullable private final String metricServiceQueryAddress;
@@ -295,6 +297,9 @@ public abstract class Dispatcher extends FencedRpcEndpoint<DispatcherId>
 
         this.executionGraphInfoStore = dispatcherServices.getArchivedExecutionGraphStore();
 
+        this.durableExecutionGraphInfoPersister =
+                DurableExecutionGraphInfoPersister.fromConfiguration(configuration).orElse(null);
+
         this.jobManagerRunnerFactory = dispatcherServices.getJobManagerRunnerFactory();
         this.cleanupRunnerFactory = dispatcherServices.getCleanupRunnerFactory();
 
@@ -357,6 +362,7 @@ public abstract class Dispatcher extends FencedRpcEndpoint<DispatcherId>
             throw exception;
         }
 
+        hydrateExecutionGraphInfoStoreFromDurableStorage();
         startCleanupRetries();
         startRecoveredJobs();
 
@@ -1367,13 +1373,78 @@ public abstract class Dispatcher extends FencedRpcEndpoint<DispatcherId>
                     CleanupJobState.localCleanup(terminalJobStatus));
         }
 
+        // Durably persist the execution graph (with its checkpoint statistics and final
+        // savepoint path) BEFORE the job can be registered as terminated in the JobResultStore.
+        // This guarantees that a durably-terminal job always has recoverable details after a
+        // JobManager failure. If persisting fails, we fail the JobManager instead of
+        // proceeding: the crash then looks like one that happened before the terminal state
+        // was reached, so the job is simply recovered and re-terminated.
+        final CompletableFuture<Void> durablePersistFuture =
+                persistExecutionGraphInfoDurably(executionGraphInfo);
+
         // do not create an archive for suspended jobs, as this would eventually lead to
         // multiple archive attempts which we currently do not support
-        CompletableFuture<Acknowledge> archiveFuture =
-                archiveExecutionGraphToHistoryServer(executionGraphInfo);
+        return durablePersistFuture
+                .thenCompose(ignored -> archiveExecutionGraphToHistoryServer(executionGraphInfo))
+                .thenCompose(
+                        ignored ->
+                                registerGloballyTerminatedJobInJobResultStore(executionGraphInfo));
+    }
 
-        return archiveFuture.thenCompose(
-                ignored -> registerGloballyTerminatedJobInJobResultStore(executionGraphInfo));
+    private CompletableFuture<Void> persistExecutionGraphInfoDurably(
+            ExecutionGraphInfo executionGraphInfo) {
+        if (durableExecutionGraphInfoPersister == null
+                || !DurableExecutionGraphInfoPersister.isEligible(executionGraphInfo)) {
+            return FutureUtils.completedVoidFuture();
+        }
+        final JobID jobId = executionGraphInfo.getJobId();
+        return durableExecutionGraphInfoPersister
+                .persistAsync(executionGraphInfo, ioExecutor)
+                .whenCompleteAsync(
+                        (ignored, error) -> {
+                            if (error != null) {
+                                onFatalError(
+                                        new FlinkException(
+                                                String.format(
+                                                        "Could not durably persist the execution graph of globally terminated job %s. "
+                                                                + "Failing the JobManager to avoid marking the job as terminated without recoverable details.",
+                                                        jobId),
+                                                error));
+                            }
+                        },
+                        getMainThreadExecutor(jobId));
+    }
+
+    private void hydrateExecutionGraphInfoStoreFromDurableStorage() {
+        if (durableExecutionGraphInfoPersister == null) {
+            log.info(
+                    "IMC: using this patch - durable completed-jobs store is DISABLED ({} is not set); "
+                            + "completed jobs do not survive a JobManager restart.",
+                    CompletedJobsPersistenceOptions.COMPLETED_JOBS_PERSIST_DIR.key());
+            return;
+        }
+        log.info(
+                "IMC: using this patch - durable completed-jobs store is ENABLED: {}.",
+                durableExecutionGraphInfoPersister);
+        // runs in onStart, i.e. before any RPC is processed, so REST never observes a
+        // partially hydrated store
+        int restored = 0;
+        for (ExecutionGraphInfo executionGraphInfo : durableExecutionGraphInfoPersister.loadAll()) {
+            try {
+                executionGraphInfoStore.put(executionGraphInfo);
+                restored++;
+                log.info(
+                        "Restored completed job {} ({}) from durable storage.",
+                        executionGraphInfo.getArchivedExecutionGraph().getJobName(),
+                        executionGraphInfo.getJobId());
+            } catch (IOException e) {
+                log.warn(
+                        "Could not restore completed job {} into the execution graph store.",
+                        executionGraphInfo.getJobId(),
+                        e);
+            }
+        }
+        log.info("Restored {} completed job(s) from durable storage.", restored);
     }
 
     private CompletableFuture<CleanupJobState> registerGloballyTerminatedJobInJobResultStore(
